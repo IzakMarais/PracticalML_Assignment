@@ -1,0 +1,218 @@
+---
+title: 'Prediction assignment : are participants lifting barbells correctly?'
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+```
+
+# Summary
+
+We want to answer the question of whether participants are performing barbell lifts correctly. Our data comes from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. Participants were asked to perform barbell lifts correctly and incorrectly in 5 different ways. 
+
+# Data loading
+
+We fetch the train and the test data. More information on the data is available [here](http://groupware.les.inf.puc-rio.br/har). 
+
+Exploration of the data revealed that many numeric variables have values "NA" and "#DIV/0!" in some rows, so we convert these to numeric NA values on load. 
+
+```{r message=FALSE}
+library(dplyr)
+library(caret)
+library(gbm)
+
+if(!file.exists("data")) {
+  dir.create("data")
+  download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", "data/train.csv")
+  download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", "data/test.csv")
+}
+trainFile <- read.csv("data/train.csv", na.strings = c("#DIV/0!", "NA"))
+testFile <- read.csv("data/test.csv")
+```
+
+
+# Study design
+
+First we must consider the study design (the split of data between training, validation and testing sets).
+```{r}
+rbind(trainFile=dim(trainFile), testFile=dim(testFile))
+```
+
+
+There are 160 variables (including the outcome *classe*). We see that there are 19622 observations in our train file, and only 20 in our test file. We set aside the test file data for now (this is only intended for the final automated test part of the assignment).
+Since we have a large sample size, a rule of thumb for splitting our data would be 60% train, 20% validation, 20% test. We split the trainFile data into 80% training data (which the `Caret train()` function will split into train and validate data) and 20% testing data (which we will use to report out of sample error).
+
+We create our train set 
+
+```{r}
+set.seed(1234)
+inTrain <- createDataPartition(trainFile$classe, p=.8, list=FALSE)
+train <- trainFile[inTrain,]
+test <- trainFile[-inTrain,]
+```
+
+# Data exploration
+
+## Plotting predictors
+
+We do exploration only on the training set to avoid making variable selection decisions on the test set, which could cause overfitting. 
+
+We see the data can be divided into raw accelerometer data and aggregated derived features based on windows of data. We suspect it may be easier to separate the classes using these aggregated derived features. 
+
+Usually we would set aside the test file and only use segmented training data to build and refine our model. However, the available test data shows us which variables/features will be available when we apply our model. If we inspect the test file, we see that all the aggregated features are NULL. 
+
+```{r}
+str(testFile, list.len=20)
+```
+
+Futhermore the test data points are not continous in time. This means that we cannot derive the aggregated features from our test data points. Therefore we cannot use aggregated features at all in our model training. By inspecting the data we see the aggragted features are those starting with 'total_', 'skewness_', 'max_', 'min_', 'amplitude_', 'var_', 'avg_', 'stddev_'.
+
+There are more columns that we *won't* be using as features in our classifier:
+ - `X`: the row index
+ - `user_name` : the name of one of the 6 participants. We want out classifer to detect outcome class independant of the person perfroming the experiment
+ - `new_window` and `num_window: these define the windows used to create derived features.
+ - `classe` the dependent, outcome variable we wish to predict
+
+
+```{r}
+train_reduced <- train %>% select(-c(X, user_name, raw_timestamp_part_1, raw_timestamp_part_2, cvtd_timestamp, num_window, new_window), -starts_with("total_"), -starts_with("skewness_"), -starts_with("max_"), -starts_with("min_"), -starts_with("amplitude_"), -starts_with("var_"), -starts_with("avg_"), -starts_with("stddev_"), -starts_with("kurtosis_"))
+
+colnames(train_reduced)
+```
+
+Next we explore the relationship between these varialbes and the outcome via plots and understand them. See appendix for the plots.
+
+Looking at these we see that this is not single variable that can cleanly  separates the five clases. Furthermore the "gyros_" variables seem to have one or two extreme outliers.
+
+```{r}
+summary(train_reduced$gyros_dumbbell_y)
+```
+
+We aslo note that not all variables are on the same scale.
+
+## Training a model
+
+We choose gradient boosted trees as the model. This type of model is appropriate since it:
+
+* can achieve excellent accuracy on data mining tasks
+* is not very sensitive to outliers in the data
+* can give variable importance scores that aid in interprebality
+* is insensitive to monotone transorfmation of inputs (which means we do not need to scale all variables to be the same range)
+
+The trainControl configuration will instruct the caret train function to use 5 fold cross validation for measuring the training accuracy.
+
+```{r}
+fitControl <- trainControl(method = "repeatedcv", number=5, repeats = 5)
+set.seed(123)
+
+if(!file.exists("gbmFit1.rds")) {
+  gbmFit1 <- train(classe ~., data=train_reduced, method="gbm", trControl = fitControl)
+  saveRDS(gbmFit1, "gbmFit1.rds")
+} else {
+  gbmFit1 <- readRDS("gbmFit1.rds")
+}
+gbmFit1
+```
+
+The best cross validation train accuracy achieved here is 96%. That the final model here has interaction.depth = 3 (an indicator of the depth of each of the trees in the 150 tree model), indicates that the classes are best separated by considering interactions between mulitple variables. This is consistent with our exploratory plotting where we saw no single variable was able to clearly distinguish between the classes.
+
+```{r}
+ggplot(gbmFit1)
+```
+
+We see that for this set of tuning paramter values maximum tree depth = 3 and number of trees = 150 gave the best results. Next we adjust the tuning parameter grid search to see if we can find a better model. Based on the first training run, we are interested to see if performance keeps increasing with larger tree depth trees and with more trees. So we extend of grid of tuning parameters in both those dircetions. 
+
+```{r}
+gbmGrid <-  expand.grid(interaction.depth = c(3, 6, 9), 
+                        n.trees = c(100, 200, 300, 400),
+                        shrinkage = 0.1,
+                        n.minobsinnode = 10)
+
+nrow(gbmGrid)
+```
+
+So this paramter space grid search will try 12 different combinations of hyper parameters. 
+
+```{r}
+if(!file.exists("gbmFit2.rds")) {
+  gbmFit2 <- train(classe ~., data=train_reduced, method="gbm", trControl = fitControl, tuneGrid = gbmGrid)
+  saveRDS(gbmFit2, "gbmFit2.rds")
+} else {
+  gbmFit2 <- readRDS("gbmFit2.rds")
+}
+gbmFit2
+```
+
+
+```{r}
+ggplot(gbmFit2)
+```
+
+Again the most complex model (maximum tree depth and number of trees) performed the best. However all the accuracies above 0.99 are pretty similar. Since increased model complexity has a greater danger of overfitting, we could decide to choose a simpler model, for instance the depth 6 one with 250 trees. 
+
+# Variable importance
+
+Another useful property of boosted trees is the variable importance estimate, which makes the model a bit more interpratable. From the 48 variables, we see the relative importanc of the top 10 visualsed below.
+
+```{r}
+plot(varImp(gbmFit2), top=10)
+```
+
+Out of intereset, let us visually inspect how well the classes are separable using the two most important variables
+
+```{r}
+qplot(x=roll_belt, y=yaw_belt, data=train_reduced, color=classe)
+```
+
+Even when visualising with the two most important variables, we observe a large amount of overlap between classes. This confirms the importance of combining more than two variables in the final model (as seen in models with higher interaction depth performing better).
+
+
+# Expected out of sample error
+
+To estimate the out of sample error, we use our held out test data.
+
+
+```{r}
+confusionMatrix(data = predict(gbmFit2, newdata=test), reference = test$classe)
+```
+
+We observe very good performance on the held out test dataset. Accuracy of 99% is statistially significantly better than the no information rate of 28% (i.e. what you would achieve with random guessing). We expect a 99% out of sample accuracy, when any of the same 6 users perform the same actions again. 
+
+However, we should not assume that this means the model will generalise with such high accuracy to *new users* performaning the experiments. Recall that there are only 6 participans and our both training and test set used data form all participants. If we want to get a better idea how the a model trained on one set of users generalises to a new user we would need a different train/test data split. 
+
+# Appendix
+
+## Exploration of class balance
+
+We want to predict the "classe" variable (the manner in which participants did the exercise). First we look for an imbalance in outcome classes. Looking at the spread of the training data observations we see that there are more observations in class A (the correct class) than in classes B-E:
+
+```{r}
+summary(train$classe)
+```
+Training data that is somewhat unbalanced in number of observations between the outcome classes might bias our classifier. We will keep this in mind when interpreting our results.
+
+We could try to compensate for the unbalanced training data, by randomly discarding data from the classes having more observations than class D (2573).
+
+```{r}
+trainBalanced <- train %>% group_by(classe) %>% sample_n(2573)
+summary(trainBalanced$classe)
+```
+This naive approach to balancing is thowing away potentially useful training data. Due to the good results we could achieve on the train set with cross validation, we did not need to consider balancing. 
+
+## Plots of independant variables vs outcome
+
+We investigated all the variables, but for brevity only include 5 examples here.
+
+```{r}
+library(ggplot2)
+to_plot <- setdiff(colnames(train_reduced), "classe")
+for (i in to_plot[1:5]) {
+  print(ggplot(train_reduced, aes_string(x="classe", y=i, colour="classe")) + geom_boxplot())
+}
+```
+
+
